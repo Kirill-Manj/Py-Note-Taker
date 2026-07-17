@@ -1,54 +1,189 @@
-import cv2
-import numpy as np
-import mediapipe as mp
+import cv2, numpy as np, mediapipe as mp, time
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+mp_hands=mp.solutions.hands
+hands=mp_hands.Hands(max_num_hands=2,min_detection_confidence=0.5,min_tracking_confidence=0.5)
+cap=cv2.VideoCapture(0,cv2.CAP_DSHOW)
+if not cap.isOpened(): raise RuntimeError("Couldn't open webcam.")
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+snapshots=[]; pending=False; start=0; current=None
 
-if not cap.isOpened():
-    raise RuntimeError("Couldn't open webcam.")
+# -----------------------------
+# Mouse drawing state
+# -----------------------------
+mouse_down=False
+mouse_point=None
+drawing=False
+current_stroke=None
 
+# -----------------------------
+# Helpers
+# -----------------------------
+def lerp(a,b,t): return a*(1-t)+b*t
+
+def bilinear(p00,p10,p11,p01,u,v):
+    top=lerp(p00,p10,u); bot=lerp(p01,p11,u)
+    return lerp(top,bot,v)
+
+def screen_to_uv(quad, point, samples=25):
+    pts=quad.astype(np.float32)
+    best=None; best_err=1e9
+    for u in np.linspace(0,1,samples):
+        for v in np.linspace(0,1,samples):
+            p=bilinear(pts[0],pts[1],pts[2],pts[3],u,v)
+            err=np.linalg.norm(p-point)
+            if err<best_err:
+                best_err=err; best=(u,v)
+    return best
+
+def uv_to_screen(quad,u,v):
+    pts=quad.astype(np.float32)
+    return bilinear(pts[0],pts[1],pts[2],pts[3],u,v)
+
+# -----------------------------
+# Mouse callback
+# -----------------------------
+def mouse_cb(event,x,y,flags,param):
+    global mouse_down, mouse_point
+
+    if event==cv2.EVENT_LBUTTONDOWN:
+        mouse_down=True
+        mouse_point=np.array([x,y],dtype=np.float32)
+
+    elif event==cv2.EVENT_MOUSEMOVE:
+        if mouse_down:
+            mouse_point=np.array([x,y],dtype=np.float32)
+
+    elif event==cv2.EVENT_LBUTTONUP:
+        mouse_down=False
+        mouse_point=None
+
+cv2.namedWindow("Deforming Force Field")
+cv2.setMouseCallback("Deforming Force Field", mouse_cb)
+
+# -----------------------------
+# Field rendering
+# -----------------------------
+def draw_field(frame, quad, div=12):
+    pts=quad.astype(np.float32)
+    mask=np.zeros(frame.shape[:2],np.uint8)
+    cv2.fillPoly(mask,[quad.astype(np.int32)],255)
+
+    inv=cv2.bitwise_not(frame)
+    frame[mask==255]=((0.6*frame[mask==255]+0.4*inv[mask==255])).astype(np.uint8)
+
+    for i in range(div+1):
+        u=i/div; prev=None
+        for j in range(div+1):
+            v=j/div
+            p=bilinear(pts[0],pts[1],pts[2],pts[3],u,v)
+            p=tuple(np.int32(p))
+            if prev is not None: cv2.line(frame,prev,p,(255,255,255),1)
+            prev=p
+
+    for j in range(div+1):
+        v=j/div; prev=None
+        for i in range(div+1):
+            u=i/div
+            p=bilinear(pts[0],pts[1],pts[2],pts[3],u,v)
+            p=tuple(np.int32(p))
+            if prev is not None: cv2.line(frame,prev,p,(255,255,255),1)
+            prev=p
+
+    cv2.polylines(frame,[quad.astype(np.int32)],True,(0,255,255),2)
+
+# -----------------------------
+# Draw saved strokes
+# -----------------------------
+def draw_strokes(frame, snapshots):
+    for s in snapshots:
+        quad=s["quad"]
+        for stroke in s["strokes"]:
+            if len(stroke)<2: continue
+            for i in range(len(stroke)-1):
+                u1,v1=stroke[i]
+                u2,v2=stroke[i+1]
+                p1=uv_to_screen(quad,u1,v1)
+                p2=uv_to_screen(quad,u2,v2)
+                cv2.line(frame,tuple(np.int32(p1)),tuple(np.int32(p2)),(0,0,255),2)
+
+# -----------------------------
+# Main loop
+# -----------------------------
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    ok,frame=cap.read()
+    if not ok: break
 
-    frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb)
+    frame=cv2.flip(frame,1)
+    rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+    res=hands.process(rgb)
 
-    if results.multi_hand_landmarks and len(results.multi_hand_landmarks) == 2:
-        h, w, _ = frame.shape
+    for q in snapshots:
+        draw_field(frame,q["quad"])
 
-        h1 = results.multi_hand_landmarks[0]
-        h2 = results.multi_hand_landmarks[1]
+    draw_strokes(frame,snapshots)
 
-        t1 = (int(h1.landmark[4].x * w), int(h1.landmark[4].y * h))
-        f1 = (int(h1.landmark[8].x * w), int(h1.landmark[8].y * h))
+    # -------------------------
+    # Save snapshot logic
+    # -------------------------
+    if res.multi_hand_landmarks and len(res.multi_hand_landmarks)==2:
+        h,w=frame.shape[:2]
+        a,b=res.multi_hand_landmarks
 
-        t2 = (int(h2.landmark[4].x * w), int(h2.landmark[4].y * h))
-        f2 = (int(h2.landmark[8].x * w), int(h2.landmark[8].y * h))
+        t1=np.array([a.landmark[4].x*w,a.landmark[4].y*h])
+        i1=np.array([a.landmark[8].x*w,a.landmark[8].y*h])
+        t2=np.array([b.landmark[4].x*w,b.landmark[4].y*h])
+        i2=np.array([b.landmark[8].x*w,b.landmark[8].y*h])
 
-        cv2.circle(frame, t1, 6, (255, 0, 0), -1)
-        cv2.circle(frame, f1, 6, (0, 0, 255), -1)
-        cv2.circle(frame, t2, 6, (255, 0, 0), -1)
-        cv2.circle(frame, f2, 6, (0, 0, 255), -1)
+        current=np.array([i1,i2,t2,t1],dtype=np.int32)
+        draw_field(frame,current)
 
-        pts = np.array([f1, f2, t2, t1], np.int32)
+    # -------------------------
+    # Mouse drawing (NEW)
+    # -------------------------
+    if mouse_down and mouse_point is not None:
+        for idx,s in enumerate(snapshots):
+            uv=screen_to_uv(s["quad"],mouse_point)
 
-        mask = np.zeros(frame.shape[:2], np.uint8)
-        cv2.fillPoly(mask, [pts], 255)
+            if uv is None:
+                continue
 
-        inv = cv2.bitwise_not(frame)
-        frame[mask == 255] = inv[mask == 255]
+            if "active_stroke" not in s:
+                s["active_stroke"]=[uv]
+            else:
+                s["active_stroke"].append(uv)
 
-        cv2.polylines(frame, [pts], True, (0, 255, 0), 3)
+    else:
+        # commit strokes when mouse released
+        for s in snapshots:
+            if "active_stroke" in s:
+                if len(s["active_stroke"])>1:
+                    s["strokes"].append(s["active_stroke"])
+                del s["active_stroke"]
 
-    cv2.imshow("Quadrilateral", frame)
+    # -------------------------
+    # Snapshot countdown
+    # -------------------------
+    if pending:
+        rem=max(0,10-int(time.time()-start))
+        cv2.putText(frame,f"Snapshot in {rem}",(20,40),0,1,(0,255,255),2)
+        if time.time()-start>=10:
+            if current is not None:
+                snapshots.append({
+                    "quad":current.copy(),
+                    "strokes":[]
+                })
+            pending=False
 
-    if cv2.waitKey(1) & 0xFF == 27:
+    cv2.putText(frame,"S=Save  LMB=Draw  ESC=Quit",(10,80),
+                cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+
+    cv2.imshow("Deforming Force Field",frame)
+
+    k=cv2.waitKey(1)&0xFF
+    if k==ord('s'):
+        pending=True
+        start=time.time()
+    elif k==27:
         break
 
 cap.release()
